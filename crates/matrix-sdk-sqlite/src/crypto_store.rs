@@ -18,10 +18,11 @@ use std::{
     fmt,
     path::Path,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
+use deadpool_sqlite::{Hook, Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_crypto::{
     olm::{
         InboundGroupSession, OutboundGroupSession, PickledInboundGroupSession,
@@ -82,7 +83,20 @@ impl SqliteCryptoStore {
         let path = path.as_ref();
         fs::create_dir_all(path).await.map_err(OpenStoreError::CreateDir)?;
         let cfg = deadpool_sqlite::Config::new(path.join("matrix-sdk-crypto.sqlite3"));
-        let pool = cfg.create_pool(Runtime::Tokio1)?;
+        let pool = cfg
+            .builder(Runtime::Tokio1)
+            .map_err(|e| OpenStoreError::CreatePool(deadpool_sqlite::CreatePoolError::Config(e)))?
+            .post_create(Hook::async_fn(|conn, _| {
+                Box::pin(async move {
+                    conn.interact(|conn| conn.busy_timeout(Duration::from_secs(5)))
+                        .await
+                        .map_err(|e| deadpool_sqlite::HookError::Message(e.to_string().into()))?
+                        .map_err(|e| deadpool_sqlite::HookError::Message(e.to_string().into()))?;
+                    Ok(())
+                })
+            }))
+            .build()
+            .map_err(|e| OpenStoreError::CreatePool(deadpool_sqlite::CreatePoolError::Build(e)))?;
 
         Self::open_with_pool(pool, passphrase).await
     }
