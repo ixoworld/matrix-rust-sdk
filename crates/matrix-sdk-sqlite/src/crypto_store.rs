@@ -43,7 +43,7 @@ use ruma::{
 use rusqlite::{named_params, params_from_iter, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{fs, sync::Mutex};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use vodozemac::Curve25519PublicKey;
 
 use crate::{
@@ -595,6 +595,7 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
     }
 
     async fn reset_inbound_group_session_backup_state(&self) -> Result<()> {
+        info!("reset_inbound_group_session_backup_state: writing (NO save_changes_lock)");
         self.execute("UPDATE inbound_group_session SET backed_up = FALSE", ()).await?;
         Ok(())
     }
@@ -780,7 +781,9 @@ impl CryptoStore for SqliteCryptoStore {
         // below, and we're pickling data as we go, so we don't want to
         // invalidate data we've previously read and overwrite it in the store.
         // TODO: #2000 should make this lock go away, or change its shape.
+        info!("save_pending_changes: waiting for save_changes_lock");
         let _guard = self.save_changes_lock.lock().await;
+        info!("save_pending_changes: save_changes_lock acquired");
 
         let pickled_account = if let Some(account) = changes.account {
             *self.static_account.write().unwrap() = Some(account.static_data().clone());
@@ -810,7 +813,9 @@ impl CryptoStore for SqliteCryptoStore {
         // we're pickling data as we go, so we don't want to invalidate data
         // we've previously read and overwrite it in the store.
         // TODO: #2000 should make this lock go away, or change its shape.
+        info!("save_changes: waiting for save_changes_lock");
         let _guard = self.save_changes_lock.lock().await;
+        info!("save_changes: save_changes_lock acquired, sessions={} inbound_sessions={}", changes.sessions.len(), changes.inbound_group_sessions.len());
 
         let pickled_private_identity =
             if let Some(i) = changes.private_identity { Some(i.pickle().await) } else { None };
@@ -1164,6 +1169,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn save_tracked_users(&self, tracked_users: &[(&UserId, bool)]) -> Result<()> {
+        info!("save_tracked_users: writing {} users (NO save_changes_lock)", tracked_users.len());
         let users: Vec<(Key, Vec<u8>)> = tracked_users
             .iter()
             .map(|(u, d)| {
@@ -1349,6 +1355,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn set_custom_value(&self, key: &str, value: Vec<u8>) -> Result<()> {
+        info!(key = key, "set_custom_value: writing (NO save_changes_lock)");
         let serialized = if let Some(cipher) = &self.store_cipher {
             let encrypted = cipher.encrypt_value_data(value)?;
             rmp_serde::to_vec_named(&encrypted)?
