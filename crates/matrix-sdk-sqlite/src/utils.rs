@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use deadpool_sqlite::Object as SqliteAsyncConn;
 use itertools::Itertools;
 use matrix_sdk_store_encryption::StoreCipher;
-use rusqlite::{limits::Limit, OptionalExtension, Params, Row, Statement, Transaction};
+use rusqlite::{
+    limits::Limit, OptionalExtension, Params, Row, Statement, Transaction, TransactionBehavior,
+};
 
 use crate::{
     error::{Error, Result},
@@ -154,7 +156,13 @@ impl SqliteAsyncConnExt for SqliteAsyncConn {
         F: FnOnce(&Transaction<'_>) -> Result<T, E> + Send + 'static,
     {
         self.interact(move |conn| {
-            let txn = conn.transaction()?;
+            // Use BEGIN IMMEDIATE to acquire the writer lock eagerly. With the default
+            // BEGIN DEFERRED, a transaction starts with a read snapshot, and upgrading
+            // to a writer after another connection has committed yields the
+            // non-retryable SQLITE_BUSY_SNAPSHOT ("database is locked") error — which
+            // the configured `busy_timeout` cannot retry. IMMEDIATE makes concurrent
+            // writers wait at BEGIN (respecting `busy_timeout`) instead of failing.
+            let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let result = f(&txn)?;
             txn.commit()?;
             Ok(result)
