@@ -22,6 +22,7 @@ use matrix_sdk_store_encryption::StoreCipher;
 use rusqlite::{
     limits::Limit, OptionalExtension, Params, Row, Statement, Transaction, TransactionBehavior,
 };
+use tracing::info;
 
 use crate::{
     error::{Error, Result},
@@ -162,10 +163,68 @@ impl SqliteAsyncConnExt for SqliteAsyncConn {
             // non-retryable SQLITE_BUSY_SNAPSHOT ("database is locked") error — which
             // the configured `busy_timeout` cannot retry. IMMEDIATE makes concurrent
             // writers wait at BEGIN (respecting `busy_timeout`) instead of failing.
-            let txn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let result = f(&txn)?;
-            txn.commit()?;
-            Ok(result)
+            //
+            // Verify `busy_timeout` is actually set on this connection. If the
+            // `post_create` pool hook silently failed or was never invoked, we'd have
+            // a 0ms timeout and every concurrent writer would fail instantly. Logs
+            // this value so we can correlate with "database is locked" crashes.
+            let busy_ms: i32 = conn
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap_or(-1);
+            info!(busy_timeout_ms = busy_ms, "with_transaction: BEGIN IMMEDIATE about to start");
+
+            let txn = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+                Ok(t) => {
+                    info!("with_transaction: BEGIN IMMEDIATE succeeded");
+                    t
+                }
+                Err(e) => {
+                    let (primary, extended) = match &e {
+                        rusqlite::Error::SqliteFailure(err, _) => {
+                            (err.code as i32, err.extended_code)
+                        }
+                        _ => (-1, -1),
+                    };
+                    info!(
+                        primary_code = primary,
+                        extended_code = extended,
+                        error = ?e,
+                        "with_transaction: BEGIN IMMEDIATE FAILED"
+                    );
+                    return Err(E::from(e));
+                }
+            };
+
+            let result = match f(&txn) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Can't format `E` (no Debug bound on generic), just mark the step.
+                    info!("with_transaction: transaction body FAILED");
+                    return Err(e);
+                }
+            };
+
+            match txn.commit() {
+                Ok(()) => {
+                    info!("with_transaction: COMMIT succeeded");
+                    Ok(result)
+                }
+                Err(e) => {
+                    let (primary, extended) = match &e {
+                        rusqlite::Error::SqliteFailure(err, _) => {
+                            (err.code as i32, err.extended_code)
+                        }
+                        _ => (-1, -1),
+                    };
+                    info!(
+                        primary_code = primary,
+                        extended_code = extended,
+                        error = ?e,
+                        "with_transaction: COMMIT FAILED"
+                    );
+                    Err(E::from(e))
+                }
+            }
         })
         .await
         .unwrap()
