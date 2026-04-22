@@ -17,7 +17,10 @@ use std::{
     collections::HashMap,
     fmt,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -55,6 +58,14 @@ use crate::{
     OpenStoreError,
 };
 
+/// Monotonic counter used to assign a unique `store_id` to each
+/// `SqliteCryptoStore` instance. Diagnostic only: if multiple stores end up
+/// opened against the same DB file, their per-instance `save_changes_lock`s
+/// can't serialize writes across instances and we see SQLite-level
+/// contention. Emitting this id in every write-path trace makes it trivial
+/// to detect.
+static STORE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 /// A sqlite based cryptostore.
 #[derive(Clone)]
 pub struct SqliteCryptoStore {
@@ -64,6 +75,14 @@ pub struct SqliteCryptoStore {
     // DB values cached in memory
     static_account: Arc<RwLock<Option<StaticAccountData>>>,
     save_changes_lock: Arc<Mutex<()>>,
+
+    // Diagnostic: unique id assigned at construction, and the DB path the
+    // store was opened against. Only used in the "SqliteCryptoStore created"
+    // log on construction (lets us correlate `store_id` back to a file);
+    // subsequent traces reference `store_id` alone to keep log volume down.
+    store_id: usize,
+    #[allow(dead_code)]
+    db_path: String,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -82,7 +101,9 @@ impl SqliteCryptoStore {
     ) -> Result<Self, OpenStoreError> {
         let path = path.as_ref();
         fs::create_dir_all(path).await.map_err(OpenStoreError::CreateDir)?;
-        let cfg = deadpool_sqlite::Config::new(path.join("matrix-sdk-crypto.sqlite3"));
+        let db_file = path.join("matrix-sdk-crypto.sqlite3");
+        let db_path_str = db_file.display().to_string();
+        let cfg = deadpool_sqlite::Config::new(db_file);
         let pool = cfg
             .builder(Runtime::Tokio1)
             .map_err(|e| OpenStoreError::CreatePool(deadpool_sqlite::CreatePoolError::Config(e)))?
@@ -98,7 +119,7 @@ impl SqliteCryptoStore {
             .build()
             .map_err(|e| OpenStoreError::CreatePool(deadpool_sqlite::CreatePoolError::Build(e)))?;
 
-        Self::open_with_pool(pool, passphrase).await
+        Self::open_with_pool_and_path(pool, passphrase, db_path_str).await
     }
 
     /// Create a sqlite-based crypto store using the given sqlite database pool.
@@ -106,6 +127,16 @@ impl SqliteCryptoStore {
     pub async fn open_with_pool(
         pool: SqlitePool,
         passphrase: Option<&str>,
+    ) -> Result<Self, OpenStoreError> {
+        // Path unknown when opened via an externally-supplied pool; the
+        // diagnostic log will just show "<unknown>".
+        Self::open_with_pool_and_path(pool, passphrase, String::from("<unknown>")).await
+    }
+
+    async fn open_with_pool_and_path(
+        pool: SqlitePool,
+        passphrase: Option<&str>,
+        db_path: String,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
         let version = conn.db_version().await?;
@@ -115,11 +146,20 @@ impl SqliteCryptoStore {
             None => None,
         };
 
+        let store_id = STORE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        info!(
+            store_id = store_id,
+            db_path = %db_path,
+            "SqliteCryptoStore created"
+        );
+
         Ok(SqliteCryptoStore {
             store_cipher,
             pool,
             static_account: Arc::new(RwLock::new(None)),
             save_changes_lock: Default::default(),
+            store_id,
+            db_path,
         })
     }
 
@@ -595,6 +635,8 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
     }
 
     async fn reset_inbound_group_session_backup_state(&self) -> Result<()> {
+        // (store_id logged in the outer CryptoStore wrapper, which has access
+        // to it; this method runs on a bare connection object.)
         info!("reset_inbound_group_session_backup_state: writing (NO save_changes_lock)");
         self.execute("UPDATE inbound_group_session SET backed_up = FALSE", ()).await?;
         Ok(())
@@ -781,9 +823,9 @@ impl CryptoStore for SqliteCryptoStore {
         // below, and we're pickling data as we go, so we don't want to
         // invalidate data we've previously read and overwrite it in the store.
         // TODO: #2000 should make this lock go away, or change its shape.
-        info!("save_pending_changes: waiting for save_changes_lock");
+        info!(store_id = self.store_id, "save_pending_changes: waiting for save_changes_lock");
         let _guard = self.save_changes_lock.lock().await;
-        info!("save_pending_changes: save_changes_lock acquired");
+        info!(store_id = self.store_id, "save_pending_changes: save_changes_lock acquired");
 
         let pickled_account = if let Some(account) = changes.account {
             *self.static_account.write().unwrap() = Some(account.static_data().clone());
@@ -813,9 +855,14 @@ impl CryptoStore for SqliteCryptoStore {
         // we're pickling data as we go, so we don't want to invalidate data
         // we've previously read and overwrite it in the store.
         // TODO: #2000 should make this lock go away, or change its shape.
-        info!("save_changes: waiting for save_changes_lock");
+        info!(store_id = self.store_id, "save_changes: waiting for save_changes_lock");
         let _guard = self.save_changes_lock.lock().await;
-        info!("save_changes: save_changes_lock acquired, sessions={} inbound_sessions={}", changes.sessions.len(), changes.inbound_group_sessions.len());
+        info!(
+            store_id = self.store_id,
+            sessions = changes.sessions.len(),
+            inbound_sessions = changes.inbound_group_sessions.len(),
+            "save_changes: save_changes_lock acquired"
+        );
 
         let pickled_private_identity =
             if let Some(i) = changes.private_identity { Some(i.pickle().await) } else { None };
@@ -1100,6 +1147,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn reset_backup_state(&self) -> Result<()> {
+        info!(store_id = self.store_id, "reset_backup_state: entering");
         Ok(self.acquire().await?.reset_inbound_group_session_backup_state().await?)
     }
 
@@ -1169,7 +1217,11 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn save_tracked_users(&self, tracked_users: &[(&UserId, bool)]) -> Result<()> {
-        info!("save_tracked_users: writing {} users (NO save_changes_lock)", tracked_users.len());
+        info!(
+            store_id = self.store_id,
+            user_count = tracked_users.len(),
+            "save_tracked_users: writing (NO save_changes_lock)"
+        );
         let users: Vec<(Key, Vec<u8>)> = tracked_users
             .iter()
             .map(|(u, d)| {
@@ -1355,7 +1407,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn set_custom_value(&self, key: &str, value: Vec<u8>) -> Result<()> {
-        info!(key = key, "set_custom_value: writing (NO save_changes_lock)");
+        info!(store_id = self.store_id, key = key, "set_custom_value: writing (NO save_changes_lock)");
         let serialized = if let Some(cipher) = &self.store_cipher {
             let encrypted = cipher.encrypt_value_data(value)?;
             rmp_serde::to_vec_named(&encrypted)?
